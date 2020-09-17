@@ -15,7 +15,6 @@
 import sys
 import os
 import shlex
-from mock import Mock as MagicMock
 sys.path.insert(0, os.path.abspath('sphinxext'))
 import sphinx_gallery
 import sphinx_bootstrap_theme
@@ -30,19 +29,10 @@ with open("../nltools/version.py") as f:
     exec(f.read(), version)
 version = version['__version__']
 
-# ReadTheDocks doesn't support necessary C dependencies (e.g., Atlas), so we
-# mock them out per https://docs.readthedocs.org/en/latest/faq.html#i-get-import-errors-on-libraries-that-depend-on-c-modules.
-
-class Mock(MagicMock):
-    __all__ = []
-    @classmethod
-    def __getattr__(cls, name):
-            return Mock()
-
 # -- General configuration ------------------------------------------------
 
 # If your documentation needs a minimal Sphinx version, state it here.
-#needs_sphinx = '1.0'
+#needs_sphinx = '3.2.1'
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
@@ -50,10 +40,10 @@ class Mock(MagicMock):
 extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
-    'sphinxcontrib.napoleon',
     'sphinx.ext.viewcode',
-    'sphinx_gallery.gen_gallery',
     'sphinx.ext.mathjax',
+    'sphinxcontrib.napoleon',
+    'sphinx_gallery.gen_gallery'
     ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -86,8 +76,8 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'nltools'
-copyright = u'2018, Cosan Lab'
-author = u'Cosan Lab'
+copyright = u'2020, Cosan Laboratory'
+author = u'Cosan Laboratory'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the

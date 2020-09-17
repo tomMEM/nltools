@@ -26,7 +26,9 @@ from nltools.stats import (correlation_permutation,
                            two_sample_permutation,
                            summarize_bootstrap,
                            matrix_permutation,
-                           jackknife_permutation)
+                           fisher_r_to_z,
+                           _calc_pvalue,
+                           _bootstrap_isc)
 from nltools.stats import regress as regression
 from nltools.plotting import (plot_stacked_adjacency,
                               plot_silhouette)
@@ -61,15 +63,18 @@ class Adjacency(object):
 
     '''
 
-    def __init__(self, data=None, Y=None, matrix_type=None, labels=None,
-                 **kwargs):
-        if matrix_type is not None:
-            if matrix_type.lower() not in ['distance', 'similarity', 'directed',
-                                           'distance_flat', 'similarity_flat',
-                                           'directed_flat']:
-                raise ValueError("matrix_type must be [None,'distance', "
-                                 "'similarity','directed','distance_flat', "
-                                 "'similarity_flat','directed_flat']")
+    def __init__(self, data=None, Y=None, matrix_type=None, labels=[], **kwargs):
+        if matrix_type is not None and matrix_type.lower() not in [
+            'distance',
+            'similarity',
+            'directed',
+            'distance_flat',
+            'similarity_flat',
+            'directed_flat',
+        ]:
+            raise ValueError("matrix_type must be [None,'distance', "
+                             "'similarity','directed','distance_flat', "
+                             "'similarity_flat','directed_flat']")
 
         if data is None:
             self.data = np.array([])
@@ -113,9 +118,8 @@ class Adjacency(object):
             self.data, self.issymmetric, self.matrix_type, self.is_single_matrix = self._import_single_data(data, matrix_type=matrix_type)
 
         if Y is not None:
-            if isinstance(Y, six.string_types):
-                if os.path.isfile(Y):
-                    Y = pd.read_csv(Y, header=None, index_col=None)
+            if isinstance(Y, six.string_types) and os.path.isfile(Y):
+                Y = pd.read_csv(Y, header=None, index_col=None)
             if isinstance(Y, pd.DataFrame):
                 if self.data.shape[0] != len(Y):
                     raise ValueError("Y does not match the correct size of "
@@ -126,7 +130,7 @@ class Adjacency(object):
         else:
             self.Y = pd.DataFrame()
 
-        if labels is not None:
+        if labels:
             if not isinstance(labels, (list, np.ndarray)):
                 raise ValueError("Make sure labels is a list or numpy array.")
             if self.is_single_matrix:
@@ -147,7 +151,7 @@ class Adjacency(object):
                         raise ValueError("All lists of labels must be same length as shape of data.")
                     self.labels = deepcopy(labels)
         else:
-            self.labels = None
+            self.labels = []
 
     def __repr__(self):
         return ("%s.%s(shape=%s, square_shape=%s, Y=%s, is_symmetric=%s,"
@@ -162,7 +166,7 @@ class Adjacency(object):
 
     def __getitem__(self, index):
         new = self.copy()
-        if isinstance(index, int):
+        if isinstance(index, (int, np.integer)):
             new.data = np.array(self.data[index, :]).squeeze()
             new.is_single_matrix = True
         else:
@@ -184,44 +188,99 @@ class Adjacency(object):
 
     def __add__(self, y):
         new = deepcopy(self)
-        if isinstance(y, (int, float)):
+        if isinstance(y, (int, np.integer, float, np.floating)):
             new.data = new.data + y
-        if isinstance(y, Adjacency):
+        elif isinstance(y, Adjacency):
             if self.shape() != y.shape():
                 raise ValueError('Both Adjacency() instances need to be the '
                                  'same shape.')
             new.data = new.data + y.data
+        else:
+            raise ValueError('Can only add int, float, or Adjacency')
+        return new
+
+    def __radd__(self, y):
+        new = deepcopy(self)
+        if isinstance(y, (int, np.integer, float, np.floating)):
+            new.data = y + new.data
+        elif isinstance(y, Adjacency):
+            if self.shape() != y.shape():
+                raise ValueError('Both Adjacency() instances need to be the '
+                                 'same shape.')
+            new.data = y.data + new.data
+        else:
+            raise ValueError('Can only add int, float, or Adjacency')
         return new
 
     def __sub__(self, y):
         new = deepcopy(self)
-        if isinstance(y, (int, float)):
+        if isinstance(y, (int, np.integer, float, np.floating)):
             new.data = new.data - y
-        if isinstance(y, Adjacency):
+        elif isinstance(y, Adjacency):
             if self.shape() != y.shape():
                 raise ValueError('Both Adjacency() instances need to be the '
                                  'same shape.')
             new.data = new.data - y.data
+        else:
+            raise ValueError('Can only subtract int, float, or Adjacency')
+        return new
+
+    def __rsub__(self, y):
+        new = deepcopy(self)
+        if isinstance(y, (int, np.integer, float, np.floating)):
+            new.data = y - new.data
+        elif isinstance(y, Adjacency):
+            if self.shape() != y.shape():
+                raise ValueError('Both Adjacency() instances need to be the '
+                                 'same shape.')
+            new.data =  y.data - new.data
+        else:
+            raise ValueError('Can only subtract int, float, or Adjacency')
         return new
 
     def __mul__(self, y):
         new = deepcopy(self)
-        if isinstance(y, (int, float)):
+        if isinstance(y, (int, np.integer, float, np.floating)):
             new.data = new.data * y
-        if isinstance(y, Adjacency):
+        elif isinstance(y, Adjacency):
             if self.shape() != y.shape():
                 raise ValueError('Both Adjacency() instances need to be the '
                                  'same shape.')
             new.data = np.multiply(new.data, y.data)
+        else:
+            raise ValueError('Can only multiply int, float, or Adjacency')
+        return new
+
+    def __rmul__(self, y):
+        new = deepcopy(self)
+        if isinstance(y, (int, np.integer, float, np.floating)):
+            new.data = y * new.data
+        elif isinstance(y, Adjacency):
+            if self.shape() != y.shape():
+                raise ValueError('Both Adjacency() instances need to be the '
+                                 'same shape.')
+            new.data = np.multiply(y.data, new.data)
+        else:
+            raise ValueError('Can only multiply int, float, or Adjacency')
+        return new
+
+    def __truediv__(self, y):
+        new = deepcopy(self)
+        if isinstance(y, (int, np.integer, float, np.floating)):
+            new.data = new.data / y
+        elif isinstance(y, Adjacency):
+            if self.shape() != y.shape():
+                raise ValueError('Both Adjacency() instances need to be the '
+                                 'same shape.')
+            new.data = np.divide(new.data, y.data)
+        else:
+            raise ValueError('Can only divide int, float, or Adjacency')
         return new
 
     @staticmethod
     def _test_is_single_matrix(data):
         """Static method because it belongs to the class, ie is only invoked via self.test_single_matrix or Adjacency.test_single_matrix and requires no self argument."""
-        if len(data.shape) == 1:
-            return True
-        else:
-            return False
+        return len(data.shape) == 1
     
     def _import_single_data(self, data, matrix_type=None):
         ''' Helper function to import single data matrix.'''
@@ -326,33 +385,42 @@ class Adjacency(object):
                 return [x.data.reshape(int(np.sqrt(x.data.shape[0])),
                                        int(np.sqrt(x.data.shape[0]))) for x in self]
 
-    def plot(self, limit=3, *args, **kwargs):
-        ''' Create Heatmap of Adjacency Matrix'''
+    def plot(self, limit=3, axes=None, *args, **kwargs):
+        ''' Create Heatmap of Adjacency Matrix
+            
+            Can pass in any sns.heatmap argument
+
+            Args:
+                limit: (int) number of heatmaps to plot if object contains multiple adjacencies (default: 3)
+                axes: matplotlib axis handle
+        '''
 
         if self.is_single_matrix:
-            f, a = plt.subplots(nrows=1, figsize=(7, 5))
-            if self.labels is None:
-                sns.heatmap(self.squareform(), square=True, ax=a,
-                            *args, **kwargs)
-            else:
-                sns.heatmap(self.squareform(), square=True, ax=a,
+            if axes is None:
+                _, axes = plt.subplots(nrows=1, figsize=(7, 5))
+            if self.labels:
+                sns.heatmap(self.squareform(), square=True, ax=axes,
                             xticklabels=self.labels,
                             yticklabels=self.labels,
                             *args, **kwargs)
-        else:
-            n_subs = np.minimum(len(self), limit)
-            f, a = plt.subplots(nrows=n_subs, figsize=(7, len(self)*5))
-            if self.labels is None:
-                for i in range(n_subs):
-                    sns.heatmap(self[i].squareform(), square=True, ax=a[i],
-                                *args, **kwargs)
             else:
-                for i in range(n_subs):
+                sns.heatmap(self.squareform(), square=True, ax=axes,
+                            *args, **kwargs)
+        else:
+            if axes is not None:
+                print("axes is ignored when plotting multiple images")
+            n_subs = np.minimum(len(self), limit)
+            _, a = plt.subplots(nrows=n_subs, figsize=(7, len(self)*5))
+            for i in range(n_subs):
+                if self.labels:
                     sns.heatmap(self[i].squareform(), square=True,
                                 xticklabels=self.labels[i],
                                 yticklabels=self.labels[i],
                                 ax=a[i], *args, **kwargs)
-        return f
+                else:
+                    sns.heatmap(self[i].squareform(), square=True, ax=a[i],
+                                *args, **kwargs)
+        return
 
     def mean(self, axis=0):
         ''' Calculate mean of Adjacency
@@ -397,6 +465,28 @@ class Adjacency(object):
                                  matrix_type=self.matrix_type + '_flat')
             elif axis == 1:
                 return np.nanstd(self.data, axis=axis)
+
+    def median(self, axis=0):
+        ''' Calculate median of Adjacency
+
+        Args:
+            axis:  (int) calculate median over features (0) or data (1).
+                    For data it will be on upper triangle.
+
+        Returns:
+            mean:  float if single, adjacency if axis=0, np.array if axis=1
+                    and multiple
+
+        '''
+
+        if self.is_single_matrix:
+            return np.nanmedian(self.data)
+        else:
+            if axis == 0:
+                return Adjacency(data=np.nanmedian(self.data, axis=axis),
+                                 matrix_type=self.matrix_type + '_flat')
+            elif axis == 1:
+                return np.nanmedian(self.data, axis=axis)
 
     def shape(self):
         ''' Calculate shape of data. '''
@@ -472,16 +562,12 @@ class Adjacency(object):
                 'issymmetric': self.issymmetric
             }, compression=kwargs.get('compression', 'blosc'))
         else:
-            if self.is_single_matrix:
-                if method == 'long':
-                    pd.DataFrame(self.data).to_csv(file_name, index=None)
-                elif method == 'square':
-                    pd.DataFrame(self.squareform()).to_csv(file_name, index=None)
-            else:
-                if method == 'long':
-                    pd.DataFrame(self.data).to_csv(file_name, index=None)
-                elif method == 'square':
-                    raise NotImplementedError('Need to decide how we should write out multiple matrices. As separate files?')
+            if method == 'long':
+                pd.DataFrame(self.data).to_csv(file_name, index=None)
+            elif self.is_single_matrix and method == 'square':
+                pd.DataFrame(self.squareform()).to_csv(file_name, index=None)
+            elif not self.is_single_matrix and method == 'square':
+                raise NotImplementedError('Need to decide how we should write out multiple matrices. As separate files?')
 
     def similarity(self, data, plot=False, perm_type='2d', n_permute=5000,
                    metric='spearman', ignore_diagonal=False, **kwargs):
@@ -489,7 +575,7 @@ class Adjacency(object):
         Default is to use spearman correlation and permutation test.
         Args:
             data: Adjacency data, or 1-d array same size as self.data
-            perm_type: (str) '1d','2d', 'jackknife', or None
+            perm_type: (str) '1d','2d', or None
             metric: (str) 'spearman','pearson','kendall'
             ignore_diagonal: (bool) only applies to 'directed' Adjacency types using perm_type=None or perm_type='1d'
         '''
@@ -506,10 +592,8 @@ class Adjacency(object):
             similarity_func = correlation_permutation
         elif perm_type == '2d':
             similarity_func = matrix_permutation
-        elif perm_type == 'jackknife':
-            similarity_func = jackknife_permutation
         else:
-            raise ValueError("perm_type must be ['1d','2d', 'jackknife', or None']")
+            raise ValueError("perm_type must be ['1d','2d', or None']")
 
         def _convert_data_similarity(data, perm_type=None, ignore_diagonal=ignore_diagonal):
             '''Helper function to convert data correctly'''
@@ -519,13 +603,13 @@ class Adjacency(object):
                     data = d[~np.eye(d.shape[0]).astype(bool)]
                 else:
                     data = data.data
-            elif (perm_type == '2d') or (perm_type == 'jackknife'):
+            elif perm_type == '2d':
                 if not data.issymmetric:
                     raise TypeError(f"data must be symmetric to do {perm_type} permutation")
                 else:
                     data = data.squareform()
             else:
-                raise ValueError("perm_type must be ['1d','2d', 'jackknife', or None']")
+                raise ValueError("perm_type must be ['1d','2d', or None']")
             return data
 
         if self.is_single_matrix:
@@ -548,19 +632,27 @@ class Adjacency(object):
                                     metric=metric, n_permute=n_permute,
                                     **kwargs) for x in self]
 
-    def distance(self, method='correlation', **kwargs):
+    def distance(self, metric='correlation', **kwargs):
         ''' Calculate distance between images within an Adjacency() instance.
 
         Args:
-            method: (str) type of distance metric (can use any scikit learn or
+            metric: (str) type of distance metric (can use any scikit learn or
                     sciypy metric)
 
         Returns:
             dist: (Adjacency) Outputs a 2D distance matrix.
 
         '''
-        return Adjacency(pairwise_distances(self.data, metric=method, **kwargs),
+        return Adjacency(pairwise_distances(self.data, metric=metric, **kwargs),
                          matrix_type='distance')
+
+    def r_to_z(self):
+        ''' Apply Fisher's r to z transformation to each element of the data
+            object.'''
+
+        out = self.copy()
+        out.data = fisher_r_to_z(out.data)
+        return out
 
     def threshold(self, upper=None, lower=None, binarize=False):
         '''Threshold Adjacency instance. Provide upper and lower values or
@@ -585,18 +677,16 @@ class Adjacency(object):
         '''
 
         b = self.copy()
-        if isinstance(upper, six.string_types):
-            if upper[-1] == '%':
-                upper = np.percentile(b.data, float(upper[:-1]))
-        if isinstance(lower, six.string_types):
-            if lower[-1] == '%':
-                lower = np.percentile(b.data, float(lower[:-1]))
+        if isinstance(upper, six.string_types) and upper[-1] == '%':
+            upper = np.percentile(b.data, float(upper[:-1]))
+        if isinstance(lower, six.string_types) and lower[-1] == '%':
+            lower = np.percentile(b.data, float(lower[:-1]))
 
         if upper and lower:
             b.data[(b.data < upper) & (b.data > lower)] = 0
-        elif upper and not lower:
+        elif upper:
             b.data[b.data < upper] = 0
-        elif lower and not upper:
+        elif lower:
             b.data[b.data > lower] = 0
         if binarize:
             b.data[b.data != 0] = 1
@@ -611,7 +701,7 @@ class Adjacency(object):
                 G = nx.DiGraph(self.squareform())
             else:
                 G = nx.Graph(self.squareform())
-            if self.labels is not None:
+            if self.labels:
                 labels = {x: y for x, y in zip(G.nodes, self.labels)}
                 nx.relabel_nodes(G, labels, copy=False)
             return G
@@ -687,7 +777,7 @@ class Adjacency(object):
                            palette={"Within": "lightskyblue", "Between": "red"}, ax=ax)
         f.set_ylabel('Average Distance')
         f.set_title('Average Group Distance')
-        return f
+        return
 
     def stats_label_distance(self, labels=None, n_permute=5000, n_jobs=-1):
         ''' Calculate permutation tests on within and between label distance.
@@ -725,7 +815,7 @@ class Adjacency(object):
             tmp_b['Type'] = 'Between'
             tmp_b['Group'] = i
             out = out.append(tmp_w).append(tmp_b)
-        stats = dict()
+        stats = {}
         for i in np.unique(labels):
             # Within group test
             tmp1 = out.loc[(out['Group'] == i) & (out['Type'] == 'Within'), 'Distance']
@@ -745,10 +835,9 @@ class Adjacency(object):
             if len(labels) != distance.shape[0]:
                 raise ValueError('Labels must be same length as distance matrix')
 
-        (f, outAll) = plot_silhouette(distance, labels, ax=None,
+        return plot_silhouette(distance, pd.Series(labels), ax=None,
                                       permutation_test=True,
                                       n_permute=5000, **kwargs)
-        return (f, outAll)
 
     def bootstrap(self, function, n_samples=5000, save_weights=False,
                   n_jobs=-1, random_state=None, *args, **kwargs):
@@ -779,7 +868,70 @@ class Adjacency(object):
         bootstrapped = Adjacency(bootstrapped)
         return summarize_bootstrap(bootstrapped, save_weights=save_weights)
 
-    def plot_mds(self, n_components=2, metric=True, labels_color=None,
+    def isc(self, n_bootstraps=5000, metric='median', ci_percentile=95, exclude_self_corr=True,
+            return_bootstraps=False, tail=2, n_jobs=-1, random_state=None):
+        ''' Compute intersubject correlation.
+        
+            This implementation uses the subject-wise bootstrap method from Chen et al., 2016.
+            Instead of recomputing the pairwise ISC using circle_shift or phase_randomization methods,
+            this approach uses the computationally more efficient method of bootstrapping the subjects
+            and computing a new pairwise similarity matrix with randomly selected subjects with replacement.
+            If the same subject is selected multiple times, we set the perfect correlation to a nan with
+            (exclude_self_corr=True). As recommended by Chen et al., 2016, we compute the median pairwise ISC
+            by default. However, if the mean is preferred, we compute the mean correlation after performing
+            the fisher r-to-z transformation and then convert back to correlations to minimize artificially
+            inflating the correlation values. We compute the p-values using the percentile method using the same
+            method in Brainiak.
+            
+            Chen, G., Shin, Y. W., Taylor, P. A., Glen, D. R., Reynolds, R. C., Israel, R. B.,
+            & Cox, R. W. (2016). Untangling the relatedness among correlations, part I:
+            nonparametric approaches to inter-subject correlation analysis at the group level.
+            NeuroImage, 142, 248-259.
+            
+            Hall, P., & Wilson, S. R. (1991). Two guidelines for bootstrap hypothesis testing.
+            Biometrics, 757-762.
+
+            Args:
+                n_bootstraps: (int) number of bootstraps
+                metric: (str) type of association metric ['spearman','pearson','kendall']
+                tail: (int) either 1 for one-tail or 2 for two-tailed test (default: 2)
+                n_jobs: (int) The number of CPUs to use to do the computation. -1 means all CPUs.
+                return_parms: (bool) Return the permutation distribution along with the p-value; default False
+
+            Returns:
+                stats: (dict) dictionary of permutation results ['correlation','p']
+
+        '''
+        
+        random_state = check_random_state(random_state)
+
+        if metric not in ['mean', 'median']:
+            raise ValueError("metric must be ['mean', 'median']")
+
+        if not self.is_single_matrix:
+            raise NotImplementedError('Currently we can only compute ISC values on single Adjacency matrices')
+        
+        if metric =='mean':
+            isc = np.tanh(self.r_to_z().mean())
+        elif metric =='median':
+            isc = self.median()
+        stats = {'isc': isc}
+        
+        all_bootstraps = Parallel(n_jobs=n_jobs)(delayed(_bootstrap_isc)(
+                    self, metric=metric, exclude_self_corr=exclude_self_corr,
+                    random_state=random_state) for i in range(n_bootstraps))
+        
+        stats['p'] = _calc_pvalue(all_bootstraps - stats['isc'], stats['isc'], tail)
+
+        stats['ci'] = (np.percentile(np.array(all_bootstraps), (100 - ci_percentile)/2, axis=0),
+                    np.percentile(np.array(all_bootstraps), ci_percentile + (100 - ci_percentile)/2, axis=0))
+        
+        if return_bootstraps:
+            stats['null_distribution'] = all_bootstraps
+            
+        return stats
+
+    def plot_mds(self, n_components=2, metric=True, labels=None, labels_color=None,
                  cmap=plt.cm.hot_r, n_jobs=-1, view=(30, 20),
                  figsize=[12, 8], ax=None, *args, **kwargs):
         ''' Plot Multidimensional Scaling
@@ -787,12 +939,11 @@ class Adjacency(object):
             Args:
                 n_components: (int) Number of dimensions to project (can be 2 or 3)
                 metric: (bool) Perform metric or non-metric dimensional scaling; default
+                labels: (list) Can override labels stored in Adjacency Class
                 labels_color: (str) list of colors for labels, if len(1) then make all same color
                 n_jobs: (int) Number of parallel jobs
                 view: (tuple) view for 3-Dimensional plot; default (30,20)
 
-            Returns:
-                fig: returns matplotlib figure
         '''
 
         if self.matrix_type != 'distance':
@@ -801,10 +952,15 @@ class Adjacency(object):
             raise ValueError("MDS only works on single matrices.")
         if n_components not in [2, 3]:
             raise ValueError('Cannot plot {0}-d image'.format(n_components))
+        if labels is not None:
+            if len(labels) != self.square_shape()[0]:
+                raise ValueError("Make sure labels matches the same shape as Adjaency data")
+        else:
+            labels = self.labels
         if labels_color is not None:
-            if self.labels is None:
+            if len(labels) == 0:
                 raise ValueError("Make sure that Adjacency object has labels specified.")
-            if len(self.labels) != len(labels_color):
+            if len(labels) != len(labels_color):
                 raise ValueError("Length of labels_color must match self.labels.")
 
         # Run MDS
@@ -814,7 +970,6 @@ class Adjacency(object):
 
         # Create Plot
         if ax is None:  # Create axis
-            returnFig = True
             fig = plt.figure(figsize=figsize)
             if n_components == 3:
                 ax = fig.add_subplot(111, projection='3d')
@@ -830,20 +985,17 @@ class Adjacency(object):
 
         # Plot labels
         if labels_color is None:
-            labels_color = ['black'] * len(self.labels)
+            labels_color = ['black'] * len(labels)
         if n_components == 3:
-            for ((x, y, z), label, color) in zip(proj, self.labels, labels_color):
+            for ((x, y, z), label, color) in zip(proj, labels, labels_color):
                 ax.text(x, y, z, label, color='white', bbox=dict(facecolor=color, alpha=1, boxstyle="round,pad=0.3"))
         else:
-            for ((x, y), label, color) in zip(proj, self.labels, labels_color):
+            for ((x, y), label, color) in zip(proj, labels, labels_color):
                 ax.text(x, y, label, color='white',  # color,
                         bbox=dict(facecolor=color, alpha=1, boxstyle="round,pad=0.3"))
 
         ax.xaxis.set_visible(False)
         ax.yaxis.set_visible(False)
-
-        if returnFig:
-            return fig
 
     def distance_to_similarity(self, beta=1):
         '''Convert distance matrix to similarity matrix
@@ -918,14 +1070,15 @@ class Adjacency(object):
             stats['beta'].data, stats['t'].data, stats['p'].data = b.squeeze(), t.squeeze(), p.squeeze()
             stats['residual'] = self.copy()
             stats['residual'].data = res
+            stats['df'] = df
         else:
             raise ValueError('X must be a Design_Matrix or Adjacency Instance.')
 
         return stats
 
     def social_relations_model(self, summarize_results=True, nan_replace=True):
-        '''Estimate the social relations model from a matrix for a round-robin design
-
+        '''Estimate the social relations model from a matrix for a round-robin design.
+        
         X_{ij} = m + \alpha_i + \beta_j + g_{ij} + \episolon_{ijl}
 
         where X_{ij} is the score for person i rating person j, m is the group mean,
@@ -1133,7 +1286,7 @@ class Adjacency(object):
             if data.is_single_matrix:
                 X, coord = fix_missing(data)
             else:
-                X = []; coord = [];
+                X = []; coord = []
                 for d in data:
                     m, c = fix_missing(d)
                     X.append(m)
@@ -1155,3 +1308,4 @@ class Adjacency(object):
             summarize_srm_results(results)
 
         return results
+

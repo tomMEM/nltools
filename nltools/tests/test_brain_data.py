@@ -1,4 +1,5 @@
 import os
+import pytest
 import numpy as np
 import nibabel as nb
 import pandas as pd
@@ -7,9 +8,7 @@ from nltools.data import (Brain_Data,
                           Adjacency,
                           Groupby)
 from nltools.stats import threshold, align
-from nltools.mask import create_sphere
-from nltools.utils import get_resource_path
-from nltools.mask import expand_mask
+from nltools.mask import create_sphere, roi_to_brain
 # from nltools.prefs import MNI_Template
 
 
@@ -69,19 +68,28 @@ def test_load(tmpdir):
 def test_shape(sim_brain_data):
     assert sim_brain_data.shape() == shape_2d
 
-
 def test_mean(sim_brain_data):
     assert sim_brain_data.mean().shape()[0] == shape_2d[1]
+    assert sim_brain_data.mean().shape()[0] == shape_2d[1]
+    assert len(sim_brain_data.mean(axis=1)) == shape_2d[0]
+    with pytest.raises(ValueError):
+        sim_brain_data.mean(axis='1')
+    assert isinstance(sim_brain_data[0].mean(), (float, np.floating))
 
+def test_median(sim_brain_data):
+    assert sim_brain_data.median().shape()[0] == shape_2d[1]
+    assert sim_brain_data.median().shape()[0] == shape_2d[1]
+    assert len(sim_brain_data.median(axis=1)) == shape_2d[0]
+    with pytest.raises(ValueError):
+        sim_brain_data.median(axis='1')
+    assert isinstance(sim_brain_data[0].median(), (float, np.floating))
 
 def test_std(sim_brain_data):
     assert sim_brain_data.std().shape()[0] == shape_2d[1]
 
-
 def test_sum(sim_brain_data):
     s = sim_brain_data.sum()
     assert s.shape() == sim_brain_data[1].shape()
-
 
 def test_add(sim_brain_data):
     new = sim_brain_data + sim_brain_data
@@ -103,8 +111,16 @@ def test_multiply(sim_brain_data):
     c1 = [.5, .5, -.5, -.5]
     new = sim_brain_data[0:4]*c1
     new2 = sim_brain_data[0]*.5 + sim_brain_data[1]*.5 - sim_brain_data[2]*.5 - sim_brain_data[3]*.5
-    np.testing.assert_almost_equal(0, (new-new2).sum(), decimal=4)
+    np.testing.assert_almost_equal((new-new2).sum(), 0, decimal=4)
 
+def test_divide(sim_brain_data):
+    new = sim_brain_data / sim_brain_data
+    assert new.shape() == shape_2d
+    np.testing.assert_almost_equal(new.mean(axis=0).mean(), 1, decimal=6)
+    value = 10
+    new2 = sim_brain_data/value
+    np.testing.assert_almost_equal(((new2*value) - new2).mean().mean(), 0, decimal=2)
+    
 def test_indexing(sim_brain_data):
     index = [0, 3, 1]
     assert len(sim_brain_data[index]) == len(index)
@@ -118,24 +134,22 @@ def test_indexing(sim_brain_data):
     assert d.shape[0:3] == shape_3d
     assert Brain_Data(d)
 
-
 def test_concatenate(sim_brain_data):
     out = Brain_Data([x for x in sim_brain_data])
     assert isinstance(out, Brain_Data)
     assert len(out) == len(sim_brain_data)
 
-
 def test_append(sim_brain_data):
     assert sim_brain_data.append(sim_brain_data).shape()[0] == shape_2d[0]*2
-
 
 def test_ttest(sim_brain_data):
     out = sim_brain_data.ttest()
     assert out['t'].shape()[0] == shape_2d[1]
-    distance = sim_brain_data.distance(method='correlation')
+
+def test_distance(sim_brain_data):
+    distance = sim_brain_data.distance(metric='correlation')
     assert isinstance(distance, Adjacency)
     assert distance.square_shape()[0] == shape_2d[0]
-
 
 def test_regress(sim_brain_data):
     sim_brain_data.X = pd.DataFrame({'Intercept': np.ones(len(sim_brain_data.Y)),
@@ -162,7 +176,6 @@ def test_regress(sim_brain_data):
     i = 1
     tt = threshold(out['t'][i], out['p'][i], .05)
     assert isinstance(tt, Brain_Data)
-
 
 def test_randomise(sim_brain_data):
     sim_brain_data.X = pd.DataFrame({'Intercept': np.ones(len(sim_brain_data.Y))})
@@ -192,27 +205,48 @@ def test_apply_mask(sim_brain_data):
     assert isinstance(s1, nb.Nifti1Image)
     masked_dat = sim_brain_data.apply_mask(s1)
     assert masked_dat.shape()[1] == np.sum(s1.get_data() != 0)
+    masked_dat = sim_brain_data.apply_mask(s1, resample_mask_to_brain=True)
+    assert masked_dat.shape()[1] == np.sum(s1.get_data() != 0)
 
 
 def test_extract_roi(sim_brain_data):
     mask = create_sphere([12, 10, -8], radius=10)
-    assert len(sim_brain_data.extract_roi(mask)) == shape_2d[0]
+    assert len(sim_brain_data.extract_roi(mask, metric='mean')) == shape_2d[0]
+    assert len(sim_brain_data.extract_roi(mask, metric='median')) == shape_2d[0]
+    n_components = 2
+    assert sim_brain_data.extract_roi(mask, metric='pca', n_components=n_components).shape == (n_components, shape_2d[0])
+    with pytest.raises(NotImplementedError):
+        sim_brain_data.extract_roi(mask, metric='p')
 
+    assert isinstance(sim_brain_data[0].extract_roi(mask, metric='mean'), (float, np.floating))
+    assert isinstance(sim_brain_data[0].extract_roi(mask, metric='median'), (float, np.floating))
+    with pytest.raises(ValueError):
+        sim_brain_data[0].extract_roi(mask, metric='pca')
+    with pytest.raises(NotImplementedError):
+        sim_brain_data[0].extract_roi(mask, metric='p')
+
+    s1 = create_sphere([15, 10, -8], radius=10)
+    s2 = create_sphere([-15, 10, -8], radius=10)
+    s3 = create_sphere([0, -15, -8], radius=10)
+    masks = Brain_Data([s1, s2, s3])
+    mask = roi_to_brain([1,2,3], masks)
+    assert len(sim_brain_data[0].extract_roi(mask, metric='mean')) == len(masks)
+    assert len(sim_brain_data[0].extract_roi(mask, metric='median')) == len(masks)
+    assert sim_brain_data.extract_roi(mask, metric='mean').shape == (len(masks), shape_2d[0])
+    assert sim_brain_data.extract_roi(mask, metric='median').shape == (len(masks), shape_2d[0])
+    assert len(sim_brain_data.extract_roi(mask, metric='pca', n_components=n_components)) == len(masks)
 
 def test_r_to_z(sim_brain_data):
     z = sim_brain_data.r_to_z()
     assert z.shape() == sim_brain_data.shape()
 
-
 def test_copy(sim_brain_data):
     d_copy = sim_brain_data.copy()
     assert d_copy.shape() == sim_brain_data.shape()
 
-
 def test_detrend(sim_brain_data):
     detrend = sim_brain_data.detrend()
     assert detrend.shape() == sim_brain_data.shape()
-
 
 def test_standardize(sim_brain_data):
     s = sim_brain_data.standardize()
@@ -226,6 +260,8 @@ def test_smooth(sim_brain_data):
     smoothed = sim_brain_data.smooth(5.0)
     assert isinstance(smoothed, Brain_Data)
     assert smoothed.shape() == sim_brain_data.shape()
+    smoothed = sim_brain_data[0].smooth(5.0)
+    assert len(smoothed.shape()) == 1
 
 def test_groupby_aggregate(sim_brain_data):
     s1 = create_sphere([12, 10, -8], radius=10)
@@ -236,7 +272,6 @@ def test_groupby_aggregate(sim_brain_data):
     mn = sim_brain_data.aggregate(mask, 'mean')
     assert isinstance(mn, Brain_Data)
     assert len(mn.shape()) == 1
-
 
 def test_threshold():
     s1 = create_sphere([12, 10, -8], radius=10)
@@ -437,41 +472,38 @@ def test_hyperalignment():
     d3 = sim.create_data(y, 3, reps=n_reps, output_dir=None).apply_mask(s1)
     data = [d1, d2, d3]
 
-    # Test procrustes using align
-    out = align(data, method='procrustes')
-    assert len(data) == len(out['transformed'])
-    assert len(data) == len(out['transformation_matrix'])
-    assert data[0].shape() == out['common_model'].shape()
-    transformed = np.dot(d1.data, out['transformation_matrix'][0])
-    centered = d1.data - np.mean(d1.data, 0)
-    transformed = (np.dot(centered/np.linalg.norm(centered), out['transformation_matrix'][0])*out['scale'][0])
-    np.testing.assert_almost_equal(0, np.sum(out['transformed'][0].data - transformed), decimal=5)
-
     # Test deterministic brain_data
+    out = align(data, method='deterministic_srm')
+
     bout = d1.align(out['common_model'], method='deterministic_srm')
-    assert d1.shape() == bout['transformed'].shape()
-    assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[1] == bout['transformation_matrix'].shape[0]
-    btransformed = np.dot(d1.data, bout['transformation_matrix'])
+    assert d1.shape() == bout['transformed'].shape
+    assert d1.shape() == bout['common_model'].shape
+    assert d1.shape()[1] == bout['transformation_matrix'].shape()[0]
+    btransformed = np.dot(d1.data, bout['transformation_matrix'].data.T)
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data - btransformed))
 
-    # Test deterministic brain_data
+    # Test probabilistic brain_data
     bout = d1.align(out['common_model'], method='probabilistic_srm')
-    assert d1.shape() == bout['transformed'].shape()
-    assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[1] == bout['transformation_matrix'].shape[0]
-    btransformed = np.dot(d1.data, bout['transformation_matrix'])
+    assert d1.shape() == bout['transformed'].shape
+    assert d1.shape() == bout['common_model'].shape
+    assert d1.shape()[1] == bout['transformation_matrix'].shape()[0]
+    btransformed = np.dot(d1.data, bout['transformation_matrix'].data.T)
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data-btransformed))
 
     # Test procrustes brain_data
+    out = align(data, method='procrustes')
+    centered = data[0].data-np.mean(data[0].data, 0)
+    transformed = (np.dot(centered/np.linalg.norm(centered), out['transformation_matrix'][0].data)*out['scale'][0])
+
     bout = d1.align(out['common_model'], method='procrustes')
     assert d1.shape() == bout['transformed'].shape()
     assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[1] == bout['transformation_matrix'].shape[0]
+    assert d1.shape()[1] == bout['transformation_matrix'].shape()[0]
     centered = d1.data - np.mean(d1.data, 0)
-    btransformed = (np.dot(centered/np.linalg.norm(centered), bout['transformation_matrix'])*bout['scale'])
+    btransformed = (np.dot(centered/np.linalg.norm(centered), bout['transformation_matrix'].data)*bout['scale'])
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data-btransformed), decimal=5)
     np.testing.assert_almost_equal(0, np.sum(out['transformed'][0].data - bout['transformed'].data))
+
 
     # Test over time
     sim = Simulator()
@@ -483,33 +515,35 @@ def test_hyperalignment():
     d3 = sim.create_data(y, 3, reps=n_reps, output_dir=None).apply_mask(s1)
     data = [d1, d2, d3]
 
-    out = align(data, method='procrustes', axis=1)
-    assert len(data) == len(out['transformed'])
-    assert len(data) == len(out['transformation_matrix'])
-    assert data[0].shape() == out['common_model'].shape()
-    centered = data[0].data.T-np.mean(data[0].data.T, 0)
-    transformed = (np.dot(centered/np.linalg.norm(centered), out['transformation_matrix'][0])*out['scale'][0])
-    np.testing.assert_almost_equal(0, np.sum(out['transformed'][0].data-transformed.T), decimal=5)
-
+    out = align(data, method='deterministic_srm', axis=1)
     bout = d1.align(out['common_model'], method='deterministic_srm', axis=1)
-    assert d1.shape() == bout['transformed'].shape()
-    assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[0] == bout['transformation_matrix'].shape[0]
-    btransformed = np.dot(d1.data.T, bout['transformation_matrix'])
+    assert d1.shape() == bout['transformed'].shape
+    assert d1.shape() == bout['common_model'].shape
+    assert d1.shape()[0] == bout['transformation_matrix'].shape()[0]
+    btransformed = np.dot(d1.data.T, bout['transformation_matrix'].data.T)
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data-btransformed.T))
 
+    out = align(data, method='probabilistic_srm', axis=1)
     bout = d1.align(out['common_model'], method='probabilistic_srm', axis=1)
-    assert d1.shape() == bout['transformed'].shape()
-    assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[0] == bout['transformation_matrix'].shape[0]
-    btransformed = np.dot(d1.data.T, bout['transformation_matrix'])
+    assert d1.shape() == bout['transformed'].shape
+    assert d1.shape() == bout['common_model'].shape
+    assert d1.shape()[0] == bout['transformation_matrix'].shape()[0]
+    btransformed = np.dot(d1.data.T, bout['transformation_matrix'].data.T)
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data-btransformed.T))
 
+    out = align(data, method='procrustes', axis=1)
     bout = d1.align(out['common_model'], method='procrustes', axis=1)
     assert d1.shape() == bout['transformed'].shape()
     assert d1.shape() == bout['common_model'].shape()
-    assert d1.shape()[0] == bout['transformation_matrix'].shape[0]
+    assert d1.shape()[0] == bout['transformation_matrix'].shape()[0]
     centered = d1.data.T-np.mean(d1.data.T, 0)
-    btransformed = (np.dot(centered/np.linalg.norm(centered), bout['transformation_matrix'])*bout['scale'])
+    btransformed = (np.dot(centered/np.linalg.norm(centered), bout['transformation_matrix'].data)*bout['scale'])
     np.testing.assert_almost_equal(0, np.sum(bout['transformed'].data-btransformed.T), decimal=5)
     np.testing.assert_almost_equal(0, np.sum(out['transformed'][0].data-bout['transformed'].data))
+
+def test_temporal_resample(sim_brain_data):
+    up = sim_brain_data.temporal_resample(sampling_freq=1/2, target=2, target_type='hz')
+    assert len(sim_brain_data) * 4 == len(up)
+    down = up.temporal_resample(sampling_freq=2, target=1/2, target_type='hz')
+    assert len(sim_brain_data) == len(down)
+    assert len(up)/4 == len(down)

@@ -24,7 +24,6 @@ __all__ = ['pearson',
            'two_sample_permutation',
            'correlation_permutation',
            'matrix_permutation',
-           'jackknife_permutation',
            'make_cosine_basis',
            'summarize_bootstrap',
            'regress',
@@ -36,13 +35,26 @@ __all__ = ['pearson',
            'distance_correlation',
            'transform_pairwise',
            'double_center',
-           'u_center',]
+           'u_center',
+           '_bootstrap_isc',
+           'isc',
+           'isfc',
+           'isps',
+           '_compute_matrix_correlation',
+           '_phase_mean_angle',
+           '_phase_vector_length',
+           '_butter_bandpass_filter',
+           '_phase_rayleigh_p']
 
 import numpy as np
+from numpy.fft import fft, ifft
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr, kendalltau, norm, ttest_1samp
 from scipy.stats import t as t_dist
 from scipy.spatial.distance import squareform, pdist
+from scipy.linalg import orthogonal_procrustes
+from scipy.spatial import procrustes as procrust
+from scipy.signal import hilbert, butter, filtfilt
 from copy import deepcopy
 import nibabel as nib
 from scipy.interpolate import interp1d
@@ -52,9 +64,6 @@ from joblib import Parallel, delayed
 import six
 from .utils import attempt_to_import, check_square_numpy_matrix
 from .external.srm import SRM, DetSRM
-from scipy.linalg import orthogonal_procrustes
-from scipy.spatial import procrustes as procrust
-from scipy.ndimage import label, generate_binary_structure
 from sklearn.utils import check_random_state
 from sklearn.metrics import pairwise_distances
 
@@ -74,8 +83,7 @@ def pearson(x, y):
     datass = np.sqrt(np.sum(datam*datam, axis=1))
     # datass = np.sqrt(ss(datam, axis=1))
     temp = np.dot(datam[1:], datam[0].T)
-    rs = temp / (datass[1:] * datass[0])
-    return rs
+    return temp / (datass[1:] * datass[0])
 
 
 def zscore(df):
@@ -101,7 +109,7 @@ def fdr(p, q=.05):
     discovery rate q. Written by Tal Yarkoni
 
     Args:
-        p: (np.array) vector of p-values (only considers non-zero p-values)
+        p: (np.array) vector of p-values 
         q: (float) false discovery rate level
 
     Returns:
@@ -117,8 +125,7 @@ def fdr(p, q=.05):
     nvox = p.shape[0]
     null = np.array(range(1, nvox + 1), dtype='float') * q / nvox
     below = np.where(s <= null)[0]
-    fdr_p = s[max(below)] if len(below) else -1
-    return fdr_p
+    return s[max(below)] if len(below) else -1
 
 
 def holm_bonf(p, alpha=.05):
@@ -141,8 +148,7 @@ def holm_bonf(p, alpha=.05):
     nvox = p.shape[0]
     null = .05 / (nvox - np.arange(1, nvox + 1) + 1)
     below = np.where(s <= null)[0]
-    bonf_p = s[max(below)] if len(below) else -1
-    return bonf_p
+    return s[max(below)] if len(below) else -1
 
 
 def threshold(stat, p, thr=.05, return_mask=False):
@@ -286,19 +292,18 @@ def _transform_outliers(data, cutoff, replace_with_cutoff, method):
                 std = [data.mean()-data.std()*cutoff['std'][0], data.mean()+data.std()*cutoff['std'][1]]
                 q = pd.Series(index=cutoff['std'], data=std)
             # if replace_with_cutoff is false, replace with true existing values closest to cutoff
-            if method == 'winsorize':
-                if not replace_with_cutoff:
-                    q.iloc[0] = data[data > q.iloc[0]].min()
-                    q.iloc[1] = data[data < q.iloc[1]].max()
+            if method == 'winsorize' and not replace_with_cutoff:
+                q.iloc[0] = data[data > q.iloc[0]].min()
+                q.iloc[1] = data[data < q.iloc[1]].max()
         else:
             raise ValueError('cutoff must be a dictionary with quantile or std keys.')
-        if method == 'winsorize':
+        if method == 'trim':
+            data[data < q.iloc[0]] = np.nan
+            data[data > q.iloc[1]] = np.nan
+        elif method == 'winsorize':
             if isinstance(q, pd.Series) and len(q) == 2:
                 data[data < q.iloc[0]] = q.iloc[0]
                 data[data > q.iloc[1]] = q.iloc[1]
-        elif method == 'trim':
-            data[data < q.iloc[0]] = np.nan
-            data[data > q.iloc[1]] = np.nan
         return data
 
     # transform each column if a dataframe, if series just transform data
@@ -479,7 +484,6 @@ def _permute_func(data1, data2, metric, random_state=None):
     new_fmri_dist = new_fmri_dist[np.triu_indices(new_fmri_dist.shape[0], k=1)]
     return correlation(new_fmri_dist, data2, metric=metric)[0]
 
-
 def _calc_pvalue(all_p, stat, tail):
     """Calculates p value based on distribution of correlations
     This function is called by the permutation functions
@@ -489,17 +493,13 @@ def _calc_pvalue(all_p, stat, tail):
     """
     
     denom = float(len(all_p)) + 1
-    if tail == 2:
+    if tail == 1:
+        numer = np.sum(all_p >= stat) + 1 if stat >= 0 else np.sum(all_p <= stat) + 1
+    elif tail == 2:
         numer = np.sum(np.abs(all_p) >= np.abs(stat)) + 1
-    elif tail == 1:
-        if stat >= 0:
-            numer = np.sum(all_p >= stat) + 1
-        else:
-            numer = np.sum(all_p <= stat) + 1
     else:
         raise ValueError('tail must be either 1 or 2')
-    p = numer / denom
-    return p
+    return numer / denom
 
 
 def one_sample_permutation(data, n_permute=5000, tail=2, n_jobs=-1, return_perms=False, random_state=None):
@@ -512,6 +512,7 @@ def one_sample_permutation(data, n_permute=5000, tail=2, n_jobs=-1, return_perms
             n_jobs: (int) The number of CPUs to use to do the computation.
                     -1 means all CPUs.
             return_parms: (bool) Return the permutation distribution along with the p-value; default False
+            random_state: (int, None, or np.random.RandomState) Initial random seed (default: None)
 
         Returns:
             stats: (dict) dictionary of permutation results ['mean','p']
@@ -522,9 +523,7 @@ def one_sample_permutation(data, n_permute=5000, tail=2, n_jobs=-1, return_perms
     seeds = random_state.randint(MAX_INT, size=n_permute)
 
     data = np.array(data)
-    stats = dict()
-    stats['mean'] = np.mean(data)
-
+    stats = {'mean': np.nanmean(data)}
     all_p = Parallel(n_jobs=n_jobs)(delayed(_permute_sign)(data,
                                                            random_state=seeds[i]) for i in range(n_permute))
     stats['p'] = _calc_pvalue(all_p, stats['mean'], tail)
@@ -553,8 +552,7 @@ def two_sample_permutation(data1, data2, n_permute=5000,
     random_state = check_random_state(random_state)
     seeds = random_state.randint(MAX_INT, size=n_permute)
 
-    stats = dict()
-    stats['mean'] = np.mean(data1)-np.mean(data2)
+    stats = {'mean': np.nanmean(data1) - np.nanmean(data2)}
     data = pd.DataFrame(data={'Values': data1, 'Group': np.ones(len(data1))})
     data = data.append(pd.DataFrame(data={
                                         'Values': data2,
@@ -566,39 +564,61 @@ def two_sample_permutation(data1, data2, n_permute=5000,
     if return_perms:
         stats['perm_dist'] = all_p
     return stats
-
-
-def correlation_permutation(data1, data2, n_permute=5000, metric='spearman',
+        
+    
+def correlation_permutation(data1, data2, method='permute', n_permute=5000, metric='spearman',
                             tail=2, n_jobs=-1, return_perms=False, random_state=None):
-    ''' Permute correlation.
+    ''' Compute correlation and calculate p-value using permutation methods.
+
+        'permute' method randomly shuffles one of the vectors. This method is recommended
+        for independent data. For timeseries data we recommend using 'circle_shift' or
+        'phase_randomize' methods.
 
         Args:
+        
             data1: (pd.DataFrame, pd.Series, np.array) dataset 1 to permute
             data2: (pd.DataFrame, pd.Series, np.array) dataset 2 to permute
             n_permute: (int) number of permutations
             metric: (str) type of association metric ['spearman','pearson',
                     'kendall']
+            method: (str) type of permutation ['permute', 'circle_shift', 'phase_randomize']
+            random_state: (int, None, or np.random.RandomState) Initial random seed (default: None)
             tail: (int) either 1 for one-tail or 2 for two-tailed test (default: 2)
             n_jobs: (int) The number of CPUs to use to do the computation.
                     -1 means all CPUs.
             return_parms: (bool) Return the permutation distribution along with the p-value; default False
 
         Returns:
+        
             stats: (dict) dictionary of permutation results ['correlation','p']
 
     '''
+    if len(data1) != len(data2):
+        raise ValueError('Make sure that data1 is the same length as data2')
+    
+    if method not in ['permute', 'circle_shift', 'phase_randomize']:
+        raise ValueError("Make sure that method is ['permute', 'circle_shift', 'phase_randomize']")
 
     random_state = check_random_state(random_state)
 
-    stats = dict()
     data1 = np.array(data1)
     data2 = np.array(data2)
 
-    stats['correlation'] = correlation(data1, data2, metric=metric)[0]
+    stats = {'correlation':correlation(data1, data2, metric=metric)[0]}
 
-    all_p = Parallel(n_jobs=n_jobs)(delayed(correlation)(
-                    random_state.permutation(data1), data2, metric=metric)
-                    for i in range(n_permute))
+    if method == 'permute':
+        all_p = Parallel(n_jobs=n_jobs)(delayed(correlation)(
+                        random_state.permutation(data1), data2, metric=metric)
+                        for i in range(n_permute))
+    elif method == 'circle_shift':
+        all_p = Parallel(n_jobs=n_jobs)(delayed(correlation)(
+                circle_shift(data1, random_state=random_state), data2, metric=metric)
+                for i in range(n_permute))
+    elif method == 'phase_randomize':
+        all_p = Parallel(n_jobs=n_jobs)(delayed(correlation)(
+                phase_randomize(data1, random_state=random_state), phase_randomize(data2), metric=metric)
+                for i in range(n_permute))
+
     all_p = [x[0] for x in all_p]
 
     stats['p'] = _calc_pvalue(all_p, stats['correlation'], tail)
@@ -637,9 +657,7 @@ def matrix_permutation(data1, data2, n_permute=5000, metric='spearman',
     data1 = sq_data1[np.triu_indices(sq_data1.shape[0], k=1)]
     data2 = sq_data2[np.triu_indices(sq_data2.shape[0], k=1)]
 
-    stats = dict()
-
-    stats['correlation'] = correlation(data1, data2, metric=metric)[0]
+    stats = {'correlation': correlation(data1, data2, metric=metric)[0]}
 
     all_p = Parallel(n_jobs=n_jobs)(delayed(_permute_func)(
                     pd.DataFrame(sq_data1), data2, metric=metric, random_state=seeds[i])
@@ -648,55 +666,6 @@ def matrix_permutation(data1, data2, n_permute=5000, metric='spearman',
     if return_perms:
         stats['perm_dist'] = all_p
     return stats
-
-
-def jackknife_permutation(data1, data2, metric='spearman',
-                          p_value='permutation', n_jobs=-1, n_permute=5000,
-                          tail=2, random_state=None):
-    ''' This function uses a randomization test on a jackknife of absolute
-        distance/similarity of each subject
-
-        Args:
-            data1: (Adjacency, pd.DataFrame, np.array) square matrix
-            data2: (Adjacency, pd.DataFrame, np.array) square matrix
-            metric: (str) type of association metric ['spearman','pearson',
-                    'kendall']
-            tail: (int) either 1 for one-tail or 2 for two-tailed test (default: 2)
-            p_value: ['ttest', 'permutation']
-            n_permute: (int) number of permutations
-            n_jobs: (int) The number of CPUs to use to do the computation.
-                    -1 means all CPUs.
-
-        Returns:
-            stats: (dict) dictionary of permutation results ['correlation','p']
-
-    '''
-
-    random_state = check_random_state(random_state)
-
-    data1 = check_square_numpy_matrix(data1)
-    data2 = check_square_numpy_matrix(data2)
-
-    stats = {}
-    stats['all_r'] = []
-    for s in range(data1.shape[0]):
-        stats['all_r'].append(correlation(np.delete(data1[s, ], s),
-                                          np.delete(data2[s, ], s),
-                                          metric=metric)[0])
-    stats['correlation'] = np.mean(stats['all_r'])
-
-    if p_value == 'permutation':
-        stats_permute = one_sample_permutation(stats['all_r'],
-                                               n_permute=n_permute, tail=tail,
-                                               n_jobs=n_jobs,
-                                               random_state=random_state)
-        stats['p'] = stats_permute['p']
-    elif p_value == 'ttest':
-        stats['p'] = ttest_1samp(stats['all_r'], 0)[1]
-    else:
-        raise NotImplementedError("Only ['ttest', 'permutation'] are currently implemented.")
-    return stats
-
 
 def make_cosine_basis(nsamples, sampling_freq, filter_length, unit_scale=True, drop=0):
     """ Create a series of cosine basis functions for a discrete cosine
@@ -783,7 +752,7 @@ def transform_pairwise(X, y):
 
     X_new, y_new, y_group = [], [], []
     y_ndim = y.ndim
-    if y.ndim == 1:
+    if y_ndim == 1:
         y = np.c_[y, np.ones(y.shape[0])]
     comb = itertools.combinations(range(X.shape[0]), 2)
     for k, (i, j) in enumerate(comb):
@@ -989,6 +958,7 @@ def regress(X, Y, mode='ols', stats='full', **kwargs):
     if mode == 'ols' or mode == 'robust':
 
         b = np.dot(np.linalg.pinv(X), Y)
+        
         # Return betas and stop other computations if that's all that's requested
         if stats == 'betas':
             return b.squeeze()
@@ -1006,7 +976,10 @@ def regress(X, Y, mode='ols', stats='full', **kwargs):
             axis_func = [_robust_estimator, 0, res, X, robust_estimator, nlags]
             stderr = np.apply_along_axis(*axis_func)
 
-        t = b / stderr
+        # Then only compute t-stats at voxels where the standard error is at least .000001
+        t = np.zeros_like(b)
+        t[stderr > 1.e-6] = b[stderr > 1.e-6] / stderr[stderr > 1.e-6]
+
         # Return betas and ts and stop other computations if that's all that's requested
         if stats == 'tstats':
             return b.squeeze(), t.squeeze()
@@ -1076,7 +1049,7 @@ def regress_permutation(X, Y, n_permute=5000, tail=2, random_state=None, verbose
     # We could optionally Save (X.T * X)^-1 * X.T so we dont have to invert each permutation, but this would require not relying on regress() and because the second-level design mat is probably on the small side we might not actually save that much time
     # inv = np.linalg.pinv(X)
 
-    for i in range(n_permute):
+    for _ in range(n_permute):
         _, _t = regress(func(X.values), Y, stats='tstats', **kwargs)
         if tail == 2:
             p += np.abs(_t) >= np.abs(t)
@@ -1095,12 +1068,13 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
     ''' Align subject data into a common response model.
 
         Can be used to hyperalign source data to target data using
-        Hyperalignemnt from Dartmouth (i.e., procrustes transformation; see
+        Hyperalignment from Dartmouth (i.e., procrustes transformation; see
         nltools.stats.procrustes) or Shared Response Model from Princeton (see
         nltools.external.srm). (see nltools.data.Brain_Data.align for aligning
         a single Brain object to another). Common Model is shared response
-        model or centered target data.Transformed data can be back projected to
-        original data using Tranformation matrix.
+        model or centered target data. Transformed data can be back projected to
+        original data using Tranformation matrix. Inputs must be a list of Brain_Data
+        instances or numpy arrays (observations by features).
 
         Examples:
             Hyperalign using procrustes transform:
@@ -1131,7 +1105,7 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
 
     if not isinstance(data, list):
         raise ValueError('Make sure you are inputting data is a list.')
-    if not all([type(x) for x in data]):
+    if not all(type(x) for x in data):
         raise ValueError('Make sure all objects in the list are the same type.')
     if method not in ['probabilistic_srm', 'deterministic_srm', 'procrustes']:
         raise ValueError("Method must be ['probabilistic_srm','deterministic_srm','procrustes']")
@@ -1141,9 +1115,11 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
     if isinstance(data[0], Brain_Data):
         data_type = 'Brain_Data'
         data_out = [x.copy() for x in data]
+        transformation_out = [x.copy() for x in data]
         data = [x.data.T for x in data]
     elif isinstance(data[0], np.ndarray):
         data_type = 'numpy'
+        data = [x.T for x in data]
     else:
         raise ValueError('Type %s is not implemented yet.' % type(data[0]))
 
@@ -1153,7 +1129,7 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
     elif axis != 0:
         raise ValueError('axis must be 0 or 1.')
 
-    out = dict()
+    out = {}
     if method in ['deterministic_srm', 'probabilistic_srm']:
         if n_features is None:
             n_features = int(data[0].shape[0])
@@ -1163,7 +1139,7 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
             srm = SRM(features=n_features, *args, **kwargs)
         srm.fit(data)
         out['transformed'] = [x for x in srm.transform(data)]
-        out['common_model'] = srm.s_
+        out['common_model'] = srm.s_.T
         out['transformation_matrix'] = srm.w_
 
     elif method == 'procrustes':
@@ -1220,7 +1196,7 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
             disparity.append(d)
             scale.append(s)
         out['transformed'] = aligned
-        out['common_model'] = common.T
+        out['common_model'] = common
         out['transformation_matrix'] = transformation_matrix
         out['disparity'] = disparity
         out['scale'] = scale
@@ -1229,9 +1205,12 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
         out['transformed'] = [x.T for x in out['transformed']]
         out['common_model'] = out['common_model'].T
 
+        if data_type == 'Brain_Data':
+            out['transformation_matrix'] = [x.T for x in out['transformation_matrix']]
+
     # Calculate Intersubject correlation on aligned components
     if n_features is None:
-        n_features = out['common_model'].shape[0]
+        n_features = out['common_model'].shape[1]
 
     a = Adjacency()
     for f in range(n_features):
@@ -1239,19 +1218,26 @@ def align(data, method='deterministic_srm', n_features=None, axis=0,
     out['isc'] = dict(zip(np.arange(n_features), a.mean(axis=1)))
 
     if data_type == 'Brain_Data':
-        for i, x in enumerate(out['transformed']):
-            data_out[i].data = x.T
-        out['transformed'] = data_out
-        common = data_out[0].copy()
-        common.data = out['common_model'].T
-        out['common_model'] = common
+        if method == 'procrustes':
+            for i, x in enumerate(out['transformed']):
+                data_out[i].data = x.T
+                out['transformed'] = data_out
+            common = data_out[0].copy()
+            common.data = out['common_model']
+            out['common_model'] = common
+        else:
+            out['transformed'] = [x.T for x in out['transformed']]
+
+        for i,x in enumerate(out['transformation_matrix']):
+            transformation_out[i].data = x.T
+        out['transformation_matrix'] = transformation_out
 
     return out
 
 
 def procrustes(data1, data2):
     '''Procrustes analysis, a similarity test for two data sets.
-
+    
     Each input matrix is a set of points or vectors (the rows of the matrix).
     The dimension of the space is the number of columns of each matrix. Given
     two identically sized matrices, procrustes standardizes both such that:
@@ -1496,9 +1482,7 @@ def procrustes_distance(mat1, mat2, n_permute=5000, tail=2, n_jobs=-1, random_st
 
     _, _, sse = procrust(mat1, mat2)
 
-    stats = dict()
-    stats['similarity'] = sse
-
+    stats = {'similarity': sse}
     all_p = Parallel(n_jobs=n_jobs)(delayed(procrust)(random_state.permutation(mat1), mat2) for i in range(n_permute))
     all_p = [1 - x[2] for x in all_p]
 
@@ -1559,3 +1543,406 @@ def find_spikes(data, global_spike_cutoff=3, diff_spike_cutoff=3):
             outlier['diff_spike' + str(i + 1)] = 0
             outlier['diff_spike' + str(i + 1)].iloc[int(loc)] = 1
     return outlier
+
+
+def phase_randomize(data, random_state=None):
+    '''Perform phase randomization on time-series signal
+        
+        This procedure preserves the power spectrum/autocorrelation,
+        but destroys any nonlinear behavior. Based on the algorithm
+        described in:
+        
+        Theiler, J., Galdrikian, B., Longtin, A., Eubank, S., & Farmer, J. D. (1991).
+        Testing for nonlinearity in time series: the method of surrogate data
+        (No. LA-UR-91-3343; CONF-9108181-1). Los Alamos National Lab., NM (United States).
+
+        Lancaster, G., Iatsenko, D., Pidde, A., Ticcinelli, V., & Stefanovska, A. (2018).
+        Surrogate data for hypothesis testing of physical systems. Physics Reports, 748, 1-60.
+            
+        1. Calculate the Fourier transform ftx of the original signal xn.
+        2. Generate a vector of random phases in the range[0, 2π]) with
+           length L/2,where L is the length of the time series.
+        3. As the Fourier transform is symmetrical, to create the new phase
+           randomized vector ftr , multiply the first half of ftx (i.e.the half
+           corresponding to the positive frequencies) by exp(iφr) to create the
+           first half of ftr.The remainder of ftr is then the horizontally flipped
+           complex conjugate of the first half.
+        4. Finally, the inverse Fourier transform of ftr gives the FT surrogate.
+
+        Args:
+        
+            data: (np.array) data (can be 1d or 2d, time by features)
+            random_state: (int, None, or np.random.RandomState) Initial random seed (default: None)
+                 
+        Returns:
+        
+            shifted_data: (np.array) phase randomized data
+    '''
+    random_state = check_random_state(random_state)
+
+    data = np.array(data)
+    fft_data = fft(data, axis=0)
+
+    if data.shape[0] % 2 == 0:
+        pos_freq = np.arange(1, data.shape[0] // 2)
+        neg_freq = np.arange(data.shape[0] - 1, data.shape[0] // 2, -1)
+    else:
+        pos_freq = np.arange(1, (data.shape[0] - 1) // 2 + 1)
+        neg_freq = np.arange(data.shape[0] - 1, (data.shape[0] - 1) // 2, -1)
+            
+    if len(data.shape) == 1:
+        phase_shifts = random_state.uniform(0, 2*np.pi, size=(len(pos_freq)))
+        fft_data[pos_freq] *= np.exp(1j * phase_shifts)
+        fft_data[neg_freq] *= np.exp(-1j * phase_shifts)
+    else:
+        phase_shifts = random_state.uniform(0, 2*np.pi, size=(len(pos_freq), data.shape[1]))
+        fft_data[pos_freq, :] *= np.exp(1j * phase_shifts)
+        fft_data[neg_freq, :] *= np.exp(-1j * phase_shifts)
+    return np.real(ifft(fft_data, axis=0))
+
+def circle_shift(data, random_state=None):
+    '''Circle shift data for each feature
+        
+    Args:
+    
+        data: time series (1D or 2D). If 2D, then must be observations by features
+        random_state: (int, None, or np.random.RandomState) Initial random seed (default: None)
+            
+    Returns:
+    
+        shifted data
+    
+    '''
+    random_state = check_random_state(random_state)
+    data = np.array(data)
+    if len(data.shape) == 1:
+        shift = random_state.choice(np.arange(len(data)), replace=False)
+        shifted = np.concatenate((data[-shift:], data[:-shift]))
+    else:
+        shift = random_state.choice(np.arange(data.shape[0]), size=data.shape[1], replace=False)
+        shifted = np.array([np.concatenate([data[-int(s):, int(d)], data[:-int(s), int(d)]]) for d,s in zip(range(data.shape[1]), shift)]).T
+    return shifted
+    
+def _bootstrap_isc(similarity_matrix, metric='median', exclude_self_corr=True, random_state=None):
+    '''Helper function to compute bootstrapped ISC from Adjacency Instance
+
+        This function implements the subject-wise bootstrap method discussed in Chen et al., 2016.
+
+        Chen, G., Shin, Y. W., Taylor, P. A., Glen, D. R., Reynolds, R. C., Israel, R. B.,
+        & Cox, R. W. (2016). Untangling the relatedness among correlations, part I:
+        nonparametric approaches to inter-subject correlation analysis at the group level.
+        NeuroImage, 142, 248-259.
+        
+        Args:
+        
+            similarity_matrix: (Adjacency) Adjacency matrix of pairwise correlation values
+            metric: (str) type of summary statistic (Default: median)
+            exclude_self_corr: (bool) set correlations with random draws of same subject to NaN (Default: True)
+            random_state: random_state instance for permutation
+
+        Returns:
+        
+            isc: summary statistic of bootstrapped similarity matrix
+
+    '''
+    from nltools.data import Adjacency
+
+    if not isinstance(similarity_matrix, Adjacency):
+        raise ValueError('similarity_matrix must be an Adjacency instance.')
+        
+    random_state = check_random_state(random_state)
+
+    square = similarity_matrix.squareform()
+    n_sub = square.shape[0]
+    np.fill_diagonal(square, 1)
+    
+    bootstrap_subject = sorted(random_state.choice(np.arange(n_sub), size=n_sub, replace=True))
+    bootstrap_sample = Adjacency(square[bootstrap_subject, :][:, bootstrap_subject], matrix_type='similarity')
+    
+    if exclude_self_corr:
+        bootstrap_sample.data[bootstrap_sample.data == 1] = np.nan
+
+    if metric == 'mean':
+        return np.tanh(bootstrap_sample.r_to_z().mean())
+    elif metric == 'median':
+        return bootstrap_sample.median()
+
+def _compute_isc(data, metric='median'):
+    ''' Helper function to compute intersubject correlation from observations by subjects array.
+        
+        Args:
+            data: (pd.DataFrame, np.array) observations by subjects where isc is computed across subjects
+            metric: (str) type of association metric ['spearman','pearson','kendall']
+        
+        Returns:
+            isc: (float) intersubject correlation coefficient
+            
+    '''
+
+    from nltools.data import Adjacency
+
+    similarity = Adjacency(1 - pairwise_distances(data.T, metric='correlation'), matrix_type='similarity')
+    if metric =='mean':
+        isc = np.tanh(similarity.r_to_z().mean())
+    elif metric =='median':
+        isc = similarity.median()
+    return isc
+
+def isc(data, n_bootstraps=5000, metric='median', method='bootstrap', ci_percentile=95, exclude_self_corr=True,
+            return_bootstraps=False, tail=2, n_jobs=-1, random_state=None):
+    ''' Compute pairwise intersubject correlation from observations by subjects array.
+            
+        This function computes pairwise intersubject correlations (ISC) using the median as recommended by Chen
+        et al., 2016). However, if the mean is preferred, we compute the mean correlation after performing
+        the fisher r-to-z transformation and then convert back to correlations to minimize artificially
+        inflating the correlation values.
+        
+        There are currently three different methods to compute p-values. These include the classic methods for
+        computing permuted time-series by either circle-shifting the data or phase-randomizing the data
+        (see Lancaster et al., 2018). These methods create random surrogate data while preserving the temporal
+        autocorrelation inherent to the signal. By default, we use the subject-wise bootstrap method from
+        Chen et al., 2016. Instead of recomputing the pairwise ISC using circle_shift or phase_randomization methods,
+        this approach uses the computationally more efficient method of bootstrapping the subjects
+        and computing a new pairwise similarity matrix with randomly selected subjects with replacement.
+        If the same subject is selected multiple times, we set the perfect correlation to a nan with
+        (exclude_self_corr=True). We compute the p-values using the percentile method using the same
+        method in Brainiak.
+        
+        Chen, G., Shin, Y. W., Taylor, P. A., Glen, D. R., Reynolds, R. C., Israel, R. B.,
+        & Cox, R. W. (2016). Untangling the relatedness among correlations, part I:
+        nonparametric approaches to inter-subject correlation analysis at the group level.
+        NeuroImage, 142, 248-259.
+        
+        Hall, P., & Wilson, S. R. (1991). Two guidelines for bootstrap hypothesis testing.
+        Biometrics, 757-762.
+        
+        Lancaster, G., Iatsenko, D., Pidde, A., Ticcinelli, V., & Stefanovska, A. (2018).
+        Surrogate data for hypothesis testing of physical systems. Physics Reports, 748, 1-60.
+
+        Args:
+            data: (pd.DataFrame, np.array) observations by subjects where isc is computed across subjects
+            n_bootstraps: (int) number of bootstraps
+            metric: (str) type of association metric ['spearman','pearson','kendall']
+            method: (str) method to compute p-values ['bootstrap', 'circle_shift','phase_randomize'] (default: bootstrap)
+            tail: (int) either 1 for one-tail or 2 for two-tailed test (default: 2)
+            n_jobs: (int) The number of CPUs to use to do the computation. -1 means all CPUs.
+            return_parms: (bool) Return the permutation distribution along with the p-value; default False
+
+        Returns:
+            stats: (dict) dictionary of permutation results ['correlation','p']
+
+    '''
+    
+    from nltools.data import Adjacency
+
+    random_state = check_random_state(random_state)
+
+    if not isinstance(data, (pd.DataFrame, np.ndarray)):
+        raise ValueError("data must be a pandas dataframe or numpy array")
+
+    if metric not in ['mean', 'median']:
+        raise ValueError("metric must be ['mean', 'median']")
+
+
+    stats = {'isc': _compute_isc(data, metric=metric)}
+    
+    similarity = Adjacency(1 - pairwise_distances(data.T, metric='correlation'), matrix_type='similarity')
+
+    if method == 'bootstrap':
+        all_bootstraps = Parallel(n_jobs=n_jobs)(delayed(_bootstrap_isc)(
+                    similarity, metric=metric, exclude_self_corr=exclude_self_corr,
+                    random_state=random_state) for i in range(n_bootstraps))
+        stats['p'] = _calc_pvalue(all_bootstraps - stats['isc'], stats['isc'], tail)
+
+    elif method == 'circle_shift':
+        all_bootstraps = Parallel(n_jobs=n_jobs)(delayed(_compute_isc)(
+                    circle_shift(data, random_state=random_state), metric=metric)
+                                                    for i in range(n_bootstraps))
+        stats['p'] = _calc_pvalue(all_bootstraps, stats['isc'], tail)
+    elif method == 'phase_randomize':
+        all_bootstraps = Parallel(n_jobs=n_jobs)(delayed(_compute_isc)(
+                    phase_randomize(data, random_state=random_state), metric=metric)
+                                                    for i in range(n_bootstraps))
+        stats['p'] = _calc_pvalue(all_bootstraps, stats['isc'], tail)
+    else:
+        raise ValueError("method can only be ['bootstrap', 'circle_shift','phase_randomize']")
+        
+    stats['ci'] = (np.percentile(np.array(all_bootstraps), (100 - ci_percentile)/2, axis=0),
+                    np.percentile(np.array(all_bootstraps), ci_percentile + (100 - ci_percentile)/2, axis=0))
+
+    if return_bootstraps:
+        stats['null_distribution'] = all_bootstraps
+        
+    return stats
+
+def _compute_matrix_correlation(matrix1, matrix2):
+    '''Computes the intersubject functional correlation between 2 matrices (observation x feature)'''
+    return np.corrcoef(matrix1.T, matrix2.T)[matrix1.shape[1]:,:matrix2.shape[1]]
+
+def isfc(data, method='average'):
+    '''Compute intersubject functional connectivity (ISFC) from a list of observation x feature matrices
+    
+    This function uses the leave one out approach to compute ISFC (Simony et al., 2016).
+    For each subject, compute the cross-correlation between each voxel/roi
+    with the average of the rest of the subjects data. In other words,
+    compute the mean voxel/ROI response for all participants except the
+    target subject. Then compute the correlation between each ROI within
+    the target subject with the mean ROI response in the group average.
+    
+    Simony, E., Honey, C. J., Chen, J., Lositsky, O., Yeshurun, Y., Wiesel, A., & Hasson, U. (2016).
+    Dynamic reconfiguration of the default mode network during narrative comprehension.
+    Nature communications, 7, 12141.
+    
+    Args:
+        data: list of subject matrices (observations x voxels/rois)
+        method: approach to computing ISFC. 'average' uses leave one
+        
+    Returns:
+        list of subject ISFC matrices
+    
+    '''
+    subjects = np.arange(len(data))
+    
+    if method == 'average':
+        sub_isfc = []
+        for target in subjects:
+            m1 = data[target]
+            sub_mean = np.zeros(m1.shape)
+            for y in (y for y in subjects if y != target):
+                sub_mean += data[y]
+            sub_isfc.append(_compute_matrix_correlation(m1, sub_mean/(len(subjects)-1)))
+    else:
+        raise NotImplementedError('Only average method is implemented. Pairwise will be added at some point.')
+    return sub_isfc
+
+def isps(data, sampling_freq=.5, low_cut=.04, high_cut=.07, order=5):
+    '''Compute Dynamic Intersubject Phase Synchrony (ISPS from a observation by subject array)
+    
+    This function computes the instantaneous intersubject phase synchrony for a single voxel/roi
+    timeseries. Requires multiple subjects. This method is largely based on that described by Glerean
+    et al., 2012 and performs a hilbert transform on narrow bandpass filtered timeseries (butterworth)
+    data to get the instantaneous phase angle. The function returns a dictionary containing the
+    average phase angle, the average vector length, and parametric p-values computed using the rayleigh
+    test using circular statistics (Fisher, 1993).
+    
+    This function requires narrow band filtering your data. As a default we use the recommendations
+    by (Glerean et al., 2012) of .04-.07Hz. This is similar to the "slow-4" band (0.025–0.067 Hz)
+    described by (Zuo et al., 2010; Penttonen & Buzsáki, 2003), but excludes the .03 band, which has been
+    demonstrated to contain aliased respiration signals (Birn, 2006).
+
+    Birn RM, Smith MA, Bandettini PA, Diamond JB. 2006. Separating respiratory-variation-related
+    fluctuations from neuronal-activity- related fluctuations in fMRI. Neuroimage 31:1536–1548.
+    
+    Buzsáki, G., & Draguhn, A. (2004). Neuronal oscillations in cortical networks. Science,
+    304(5679), 1926-1929.
+    
+    Fisher, N. I. (1995). Statistical analysis of circular data. cambridge university press.
+
+    Glerean, E., Salmi, J., Lahnakoski, J. M., Jääskeläinen, I. P., & Sams, M. (2012).
+    Functional magnetic resonance imaging phase synchronization as a measure of dynamic
+    functional connectivity. Brain connectivity, 2(2), 91-101.
+    
+    Args:
+        data: (pd.DataFrame, np.ndarray) observations x subjects data
+        sampling_freq: (float) sampling freqency of data in Hz
+        low_cut: (float) lower bound cutoff for high pass filter
+        high_cut: (float) upper bound cutoff for low pass filter
+        order: (int) filter order for butterworth bandpass
+        
+    Returns:
+        dictionary with mean phase angle, vector length, and rayleigh statistic
+        
+    '''
+    
+    if not isinstance(data, (pd.DataFrame, np.ndarray)):
+        raise ValueError('data must be a pandas dataframe or numpy array (observations by subjects)')
+        
+    phase = np.angle(hilbert(_butter_bandpass_filter(pd.DataFrame(data), low_cut, high_cut, sampling_freq, order=order)))
+    
+    out = {'average_angle':_phase_mean_angle(phase)}
+    out['vector_length'] = _phase_vector_length(phase)
+    out['p'] = _phase_rayleigh_p(phase)
+    return out
+
+def _butter_bandpass_filter(data, low_cut, high_cut, fs, axis = 0, order=5):
+    '''Apply a bandpass butterworth filter with zero-phase filtering
+
+    Args:
+        data: (np.array)
+        low_cut: (float) lower bound cutoff for high pass filter
+        high_cut: (float) upper bound cutoff for low pass filter
+        fs: (float) sampling frequency in Hz
+        axis: (int) axis to perform filtering.
+        order: (int) filter order for butterworth bandpass
+    
+    Returns:
+        bandpass filtered data.
+    '''
+    nyq = 0.5 * fs
+    b, a = butter(order, [low_cut/nyq, high_cut/nyq], btype='band')
+    return filtfilt(b, a, data, axis=axis)
+
+def _phase_mean_angle(phase_angles):
+    '''Compute mean phase angle using circular statistics
+    
+        Can take 1D (observation for a single feature) or 2D (observation x feature) signals
+        
+        Implementation from:
+        
+            Fisher, N. I. (1995). Statistical analysis of circular data. cambridge university press.
+            
+        Args:
+            phase_angles: (np.array) 1D or 2D array of phase angles
+
+        Returns:
+            mean phase angle: (np.array)
+
+    '''
+    
+    axis = 0 if len(phase_angles.shape) == 1 else 1
+    return np.arctan2(np.mean(np.sin(phase_angles), axis=axis), np.mean(np.cos(phase_angles), axis=axis))
+
+def _phase_vector_length(phase_angles):
+    '''Compute vector length of phase angles using circular statistics
+    
+        Can take 1D (observation for a single feature) or 2D (observation x feature) signals
+        
+        Implementation from:
+        
+            Fisher, N. I. (1995). Statistical analysis of circular data. cambridge university press.
+            
+        Args:
+            phase_angles: (np.array) 1D or 2D array of phase angles
+
+        Returns:
+             phase angle vector length: (np.array)
+
+    '''
+    
+    axis = 0 if len(phase_angles.shape) == 1 else 1
+    return np.float32(np.sqrt(np.mean(np.cos(phase_angles), axis=axis)**2 + np.mean(np.sin(phase_angles), axis=axis)**2))
+
+def _phase_rayleigh_p(phase_angles):
+    '''Compute the p-value of the phase_angles using the Rayleigh statistic
+    
+        Note: this test assumes every time point is independent, which is unlikely to be true in a timeseries with autocorrelation
+
+        Implementation from:
+        
+            Fisher, N. I. (1995). Statistical analysis of circular data. cambridge university press.
+            
+        Args:
+            phase_angles: (np.array) 1D or 2D array of phase angles
+
+        Returns:
+             p-values: (np.array)
+
+    '''
+    
+    n = len(phase_angles) if len(phase_angles.shape) == 1 else phase_angles.shape[1]
+
+    Z = n*_phase_vector_length(phase_angles)**2
+    if n <= 50:
+        return np.exp(-1*Z)*(1 + (2*Z - Z**2)/(4*n) - (24*Z - 132*Z**2 +76*Z**3 - 9*Z**4)/(288*n**2))
+    else:
+        return np.exp(-1*Z)
